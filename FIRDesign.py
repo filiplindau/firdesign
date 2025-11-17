@@ -15,11 +15,14 @@ from dataclasses import dataclass, field, astuple, fields
 from collections import OrderedDict
 from typing import Any
 from enum import Enum, Flag
-from PyQt5 import QtCore, QtWidgets
+
+import pyqtgraph
+from PyQt5 import QtCore, QtWidgets, QtGui
 import numpy as np
 import argparse
 import pyqtgraph as pq
 import scipy.signal as ss
+from scipy.interpolate import interp1d
 from streamlit.runtime import get_instance
 
 from fir_design_gui import Ui_FIRDesign
@@ -78,10 +81,11 @@ class FIRFilter:
     n_taps: int = 0
     type: FilterType = FilterType.NONE
     algo: str = ""
+    decimation: int = 1
     parameters: OrderedDict[str, FilterParameter] = field(default_factory=OrderedDict)
 
     def __str__(self):
-        return f"{self.name}: {self.n_taps} taps"
+        return f"{self.name}: {self.n_taps} taps. {self.decimation}x decimation"
 
     def generate(self):
         logger.warning(f"No generator for algorithm {self.algo}")
@@ -101,7 +105,7 @@ class FIRFilter:
 @dataclass
 class FirwinFilter(FIRFilter):
     @staticmethod
-    def create(name, n_taps=1, type=FilterType.LOWPASS, fc=0.5, width=0.1):
+    def create(name, n_taps=1, type=FilterType.LOWPASS, fc=0.5, width=0.1, decimation=1):
         params = OrderedDict([("fc", FilterParameter("fc", fc, 0, 1)), ("width", FilterParameter("width", width, 0, 1))])
         filter  = FirwinFilter(name, n_taps=n_taps, type=type, algo="firwin", parameters=params)
         return filter
@@ -112,13 +116,13 @@ class FirwinFilter(FIRFilter):
 
     def __str__(self):
         return (f"{self.name}: {self.type.name} of {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.3f}, "
-                f"width {self.parameters['width'].value:.3f}")
+                f"width {self.parameters['width'].value:.3f}, {self.decimation}x decimation")
 
 
 @dataclass
 class KaiserFilter(FIRFilter):
     @staticmethod
-    def create(name, type=FilterType.LOWPASS, fc=0.5, width=0.1, stopband_att=50):
+    def create(name, type=FilterType.LOWPASS, fc=0.5, width=0.1, stopband_att=50, decimation=1):
         params = OrderedDict([("fc", FilterParameter("fc", fc, 0, 1)), ("width", FilterParameter("width", width, 0, 1)), ("stopband_att", FilterParameter("stopband_att", stopband_att, 0, 100))])
         n_taps, beta = ss.kaiserord(stopband_att, width)
         filter = KaiserFilter(name, n_taps=n_taps, type=type, algo="kaiser", parameters=params)
@@ -134,13 +138,236 @@ class KaiserFilter(FIRFilter):
     def __str__(self):
         return (f"{self.name}: {self.type.name} of {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.2f}, "
                 f"width {self.parameters['width'].value:.2f}, "
-                f"stopband attenuation {self.parameters['stopband_att'].value:.2f} dB")
+                f"stopband attenuation {self.parameters['stopband_att'].value:.2f} dB, {self.decimation}x decimation")
+
+
+@dataclass
+class RemezFilter(FIRFilter):
+    @staticmethod
+    def create(name, n_taps=1, type=FilterType.LOWPASS, fc=0.5, width=0.1, decimation=1):
+        params = OrderedDict([("fc", FilterParameter("fc", fc, 0, 1)), ("width", FilterParameter("width", width, 0, 1))])
+        filter  = RemezFilter(name, n_taps=n_taps, type=type, algo="remez", parameters=params)
+        return filter
+
+    def generate(self):
+        fc = self.parameters["fc"].value
+        width = self.parameters["width"].value
+        bands = [0, fc - width/2, fc + width/2, 1]
+        self.coe = ss.remez(self.n_taps, bands, desired=[1, 0], fs=2)
+        return self.coe
+
+    def __str__(self):
+        return (f"{self.name}: {self.type.name} of {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.3f}, "
+                f"width {self.parameters['width'].value:.3f}, {self.decimation}x decimation")
+
+NYQUIST = 48000
+
+
+class FrequencyModel(QtCore.QAbstractTableModel):
+    COL_NAME = 0
+    COL_COLOR = 1
+    COL_FREQ = 2
+    COL_ALIAS = 3
+    COL_AMP = 4
+    COL_FILTERED = 5
+
+    headers = ["Name", "", "Freq", "Aliased", "Amp / dB", "Filtered / dB"]
+
+    def __init__(self, data=None, filter_calc_cb=None, alias_calc_cb=None):
+        super().__init__()
+        self._data = data or []   # list of dicts
+        self.suffix_list = ["Hz", "kHz", "MHz", "GHz", "THz", "PHz"]
+        self.suffix_str = ""
+        self.suffix_factor = 1
+        self.filter_calc_cb = filter_calc_cb
+        self.alias_calc_cb = alias_calc_cb
+
+    # ---------------------------
+    # Required model methods
+    # ---------------------------
+    def rowCount(self, parent=None):
+        return len(self._data)
+
+    def columnCount(self, parent=None):
+        return 6
+
+    def data(self, index, role):
+        if not index.isValid():
+            return QtCore.QVariant()
+
+        row = index.row()
+        col = index.column()
+        item = self._data[row]
+
+        # Display role
+        if role == QtCore.Qt.DisplayRole or role == QtCore.Qt.EditRole:
+            if col == self.COL_NAME:
+                return item.get("name", "")
+
+            if col == self.COL_COLOR:
+                return ""
+
+            if col == self.COL_FREQ:
+                f = item.get("freq", 0) * self.suffix_factor
+                return f"{f:.2f}"
+
+            if col == self.COL_ALIAS:
+                try:
+                    f = self.alias_calc_cb(item['freq']) * self.suffix_factor
+                    return f"{f:.2f}"
+                except TypeError as e:
+                    logger.exception(f"alias")
+                    return "--"
+
+            if col == self.COL_AMP:
+                return item.get("amp", 0)
+
+            if col == self.COL_FILTERED:
+                try:
+                    f = item['freq']
+                    filt_amp = self.filter_calc_cb(f, item['amp'])
+                    return f"{filt_amp:.2f}"
+                except TypeError as e:
+                    logger.exception(f"col amp filt")
+                    return "--"
+        elif role == QtCore.Qt.UserRole:
+            if col == self.COL_NAME:
+                return item.get("name", "")
+
+            if col == self.COL_COLOR:
+                return QtGui.QColor.toRgb(item.get("color", 0))
+
+            if col == self.COL_FREQ:
+                f = item.get("freq", 0)
+                return f
+
+            if col == self.COL_ALIAS:
+                try:
+                    f = self.alias_calc_cb(item['freq'])
+                    return f
+                except TypeError as e:
+                    logger.exception(f"alias")
+                    return 0
+
+            if col == self.COL_AMP:
+                return item.get("amp", 0)
+
+            if col == self.COL_FILTERED:
+                try:
+                    # f = self.alias_calc_cb(item['freq'])
+                    f = item['freq']
+                    filt_amp = self.filter_calc_cb(f, item['amp'])
+                    return filt_amp
+                except TypeError as e:
+                    logger.exception(f"col amp filt")
+                    return 0
+        elif role == QtCore.Qt.DecorationRole:
+            if col == self.COL_COLOR:
+                color = item.get("color", QtGui.QColor(0x333333))
+                return color
+
+        return QtCore.QVariant()
+
+    def headerData(self, section, orientation, role):
+        if orientation == QtCore.Qt.Horizontal and role == QtCore.Qt.DisplayRole:
+            header_s = self.headers[section]
+            if section in [self.COL_FREQ, self.COL_ALIAS]:
+                header_s += f" / {self.suffix_str}"
+            return header_s
+        return QtCore.QVariant()
+
+    # ---------------------------
+    # Editing
+    # ---------------------------
+    def flags(self, index):
+        if not index.isValid():
+            return QtCore.Qt.NoItemFlags
+
+        col = index.column()
+
+        if col in (self.COL_NAME, self.COL_FREQ, self.COL_AMP):
+            return QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable
+
+        return QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+
+    def setData(self, index, value, role):
+        if role != QtCore.Qt.EditRole:
+            return False
+
+        row = index.row()
+        col = index.column()
+
+        try:
+            if col == self.COL_NAME:
+                self._data[row]["name"] = str(value)
+
+            elif col == self.COL_COLOR:
+                self._data[row]["color"] = QtGui.QColor(value)
+
+            elif col == self.COL_FREQ:
+                self._data[row]["freq"] = float(value) / self.suffix_factor
+
+            elif col == self.COL_AMP:
+                self._data[row]["amp"] = float(value)
+            else:
+                return False
+        except ValueError:
+            return False
+
+        # Notify views that data changed (also derived columns)
+        self.dataChanged.emit(
+            self.index(row, 0),
+            self.index(row, self.columnCount() - 1)
+        )
+        return True
+
+    # ---------------------------
+    # Derived columns
+    # ---------------------------
+
+
+    def update_filtered_amplitudes(self):
+        # Notify the view that the column has changed
+        top_left = self.index(0, self.COL_FILTERED)
+        bottom_right = self.index(len(self._data) - 1, self.COL_FILTERED)
+        self.dataChanged.emit(top_left, bottom_right)
+
+    def update_alias_freq(self):
+        # Notify the view that the column has changed
+        top_left = self.index(0, self.COL_ALIAS)
+        bottom_right = self.index(len(self._data) - 1, self.COL_ALIAS)
+        self.dataChanged.emit(top_left, bottom_right)
+
+    def update_suffix(self, suffix_factor):
+        # for r in range(len(self._data)):
+        #     k = self.suffix_factor / suffix_factor
+        #     self._data[r]["freq"] = self._data[r]["freq"] * k
+        ind = int(np.log10(suffix_factor) // 3)
+        self.suffix_factor = 10**(-3 * ind)
+        self.suffix_str = self.suffix_list[ind]
+        logger.info(f"New suffix for {suffix_factor}: {self.suffix_str}, factor {self.suffix_factor:.2e}")
+        self.headerDataChanged.emit(QtCore.Qt.Horizontal, self.COL_FREQ, self.COL_ALIAS)
+        top_left = self.index(0, self.COL_FREQ)
+        bottom_right = self.index(len(self._data) - 1, self.COL_ALIAS)
+        self.dataChanged.emit(top_left, bottom_right)
+
+    # ---------------------------
+    # Add/remove rows
+    # ---------------------------
+    def addRow(self, name="", freq=0.0, amp=0.0, color="#333333"):
+        self.beginInsertRows(QtCore.QModelIndex(), len(self._data), len(self._data))
+        self._data.append({"name": name, "freq": freq, "amp": amp, "color": QtGui.QColor(color)})
+        self.endInsertRows()
+
+    def removeRow(self, row):
+        if 0 <= row < len(self._data):
+            self.beginRemoveRows(QtCore.QModelIndex(), row, row)
+            del self._data[row]
+            self.endRemoveRows()
+
 
 
 class FIRDesign(QtWidgets.QWidget):
-    fft_done_signal = QtCore.pyqtSignal()
-    bode_done_signal = QtCore.pyqtSignal()
-    MAX_HIST = 100000
 
     def __init__(self, use_small=False, parent=None):
         logger.debug("Init")
@@ -165,18 +392,49 @@ class FIRDesign(QtWidgets.QWidget):
                            "c10": "#9467bd", "c11": "#8c564b",
                            "grey": "#7f7f7f", "white": "#eeeeee"}
 
+        self.highlight_colors = [
+            "#FF00FF",  # neon magenta
+            "#00FFFF",  # cyan / aqua
+            "#FF1493",  # deep pink
+            "#00FF00",  # pure neon green
+            "#FFA500",  # bright orange
+            "#00BFFF",  # deep sky blue
+            "#FFD700",  # gold (brighter than yellow)
+        ]
+
+        self.highlight_colors = [
+            "#F4A7B9",  # soft raspberry
+            "#F5C08A",  # warm apricot
+            "#F0E38A",  # pastel golden yellow
+            "#C6E68A",  # apple green
+            "#8FD9A7",  # mint teal
+            "#8DD6E8",  # ice blue
+            "#A6B9F0",  # soft cornflower
+            "#C9A6F0",  # lavender purple
+            "#E0A6D9",  # orchid pink
+            "#D6C3A6",  # sand beige
+            "#A6D6C3",  # pale turquoise
+            "#F0B6A6",  # coral peach
+        ]
+
         self.ui = Ui_FIRDesign()
         self.ui.setupUi(self)
 
         self.current_filter_ind = 0
         self.filter_counter = 0
+        self.freq_counter = 0
         self.n_param_widgets = 0
 
         self.amp_plot_list = list()
+        self.ph_plot_list = list()
+        self.dec_plot_list = list()
+        self.freq_scatterplot = None
+
+        self.model = FrequencyModel(filter_calc_cb=self.calc_freq_response, alias_calc_cb=self.calc_alias_freq)
 
         self.setup_layout()
 
-        filt = FirwinFilter.create("default", n_taps=19, type=FilterType.LOWPASS, fc=0.5, width=0.1)
+        filt = FirwinFilter.create("default", n_taps=19, type=FilterType.LOWPASS, fc=0.5, width=0.1, decimation=1)
         self.add_filter(filt)
 
     def setup_layout(self):
@@ -186,7 +444,9 @@ class FIRDesign(QtWidgets.QWidget):
         self.ui.ntaps_max_spinbox.editingFinished.connect(self.slider_limit_update)
         self.ui.ntaps_min_spinbox.editingFinished.connect(self.slider_limit_update)
         self.ui.ntaps_slider.valueChanged.connect(self.slider_update)
+        self.ui.decimation_spinbox.valueChanged.connect(self.update_parameters)
         self.ui.add_filter_button.clicked.connect(self.add_filter)
+        self.ui.remove_filter_button.clicked.connect(self.remove_filter)
         self.ui.filtertype_combobox.addItems(["lowpass", "highpass", "decimation"])
         self.ui.filtertype_combobox.currentIndexChanged.connect(self.update_parameters)
         self.ui.algo_combobox.addItems(["firwin", "kaiser", "remez"])
@@ -196,6 +456,15 @@ class FIRDesign(QtWidgets.QWidget):
 
         self.ui.plot0_widget.getPlotItem().showGrid(True, True)
         self.ui.plot0_widget.getPlotItem().addLegend()
+        self.ui.plot0_widget.setYRange(-5, -105)
+        self.ui.plot2_widget.getPlotItem().showGrid(True, True)
+        self.ui.plot1_widget.getPlotItem().showGrid(True, True)
+        self.ui.plot1_widget.setYRange(-5, -105)
+        ax = self.ui.plot1_widget.getPlotItem().getAxis("bottom")
+        ax.enableAutoSIPrefix(True)
+        ax.setLabel("Freq", units="Hz")
+        self.freq_scatterplot = pyqtgraph.ScatterPlotItem()
+        self.ui.plot1_widget.addItem(self.freq_scatterplot)
         self.ui.nfreq_spinbox.setValue(self.settings.value("nfreq", 2048, type=int))
         self.ui.nfreq_spinbox.editingFinished.connect(self.update_plot)
 
@@ -219,6 +488,29 @@ class FIRDesign(QtWidgets.QWidget):
             obj.valueChanged.connect(self.slider_update)
 
         self.ui.filters_list.currentItemChanged.connect(self.select_filter)
+
+        # Freq planner
+        self.ui.sampling_freq_combobox.addItems(["Hz", "kHz", "MHz", "GHz"])
+        self.ui.sampling_freq_combobox.currentIndexChanged.connect(self.set_freq_suffix)
+        self.ui.sampling_freq_combobox.setCurrentText(self.settings.value("sampling_freq_suffix", "MHz", str))
+        self.ui.sampling_freq_spinbox.setValue(self.settings.value("sampling_freq", 307, float))
+        self.ui.sampling_freq_spinbox.editingFinished.connect(self.set_sampling_freq)
+
+        self.ui.freq_table.setModel(self.model)
+        self.ui.freq_table.setSelectionBehavior(self.ui.freq_table.SelectRows)
+        self.ui.freq_table.setSelectionMode(self.ui.freq_table.SingleSelection)
+        self.model.dataChanged.connect(self.update_freq_plot)
+        self.ui.freq_table.resizeColumnsToContents()
+        self.ui.add_freq_button.clicked.connect(self.add_freq)
+        self.ui.remove_freq_button.clicked.connect(self.remove_freq)
+
+        state = self.settings.value("splitter", None)
+        if state is not None:
+            self.ui.splitter.restoreState(state)
+
+        state = self.settings.value("splitter2", None)
+        if state is not None:
+            self.ui.splitter_2.restoreState(state)
 
     def slider_update(self, value):
         """
@@ -282,6 +574,9 @@ class FIRDesign(QtWidgets.QWidget):
         Update parameters stored in FIRFilter from gui data
         :return:
         """
+        if self.ui.filters_list.currentRow() < 0:
+            logger.info("Filter list empty")
+            return
         item: QtWidgets.QListWidgetItem = self.ui.filters_list.currentItem()
         filter: FIRFilter = item.data(QtCore.Qt.UserRole)
         logger.info(f"update_parameters {filter} of {filter.algo}")
@@ -292,6 +587,8 @@ class FIRDesign(QtWidgets.QWidget):
             update_widgets = True
             if algo_type == "kaiser":
                 filter = KaiserFilter.create(filter.name)
+            elif algo_type == "remez":
+                filter = RemezFilter.create(filter.name)
             else:
                 filter = FirwinFilter.create(filter.name)
         filter.n_taps = n_taps
@@ -304,6 +601,7 @@ class FIRDesign(QtWidgets.QWidget):
                 filter.parameters[p_keys[p_ind]].value = val
                 filter.parameters[p_keys[p_ind]].min = slider_min
                 filter.parameters[p_keys[p_ind]].max = slider_max
+        filter.decimation = self.ui.decimation_spinbox.value()
         item.setText(str(filter))
         item.setData(QtCore.Qt.UserRole, filter)
         if update_widgets:
@@ -313,11 +611,15 @@ class FIRDesign(QtWidgets.QWidget):
 
 
     def start_design(self):
+        if self.ui.filters_list.currentRow() < 0:
+            logger.info("Filter list empty")
+            return
         filt = self.ui.filters_list.currentItem().data(QtCore.Qt.UserRole)
         coe = filt.generate()
         coe_str = ", ".join([f"{c:.3e}" for c in coe])
         logger.info(f"Generating {filt.name} filter: {filt.n_taps} taps using {filt.algo}.")
         self.ui.coe_label.setText(coe_str)
+        self.ui.coefficients_name_label.setText(f"{filt.name} coefficients:")
         with block_signals(self.ui.ntaps_spinbox):
             self.ui.ntaps_spinbox.setValue(filt.n_taps)
         max_val = self.ui.ntaps_max_spinbox.value()
@@ -328,28 +630,56 @@ class FIRDesign(QtWidgets.QWidget):
             self.ui.ntaps_slider.setValue(slider_val)
 
         self.update_plot()
+        self.model.update_filtered_amplitudes()
         return
 
     def add_filter(self, filt: FIRFilter = None):
         logger.info(f"Adding filter {self.filter_counter}")
         if not isinstance(filt, FIRFilter):
-            filt = copy.copy(self.ui.filters_list.currentItem().data(QtCore.Qt.UserRole))
-            filt.name = f"Filter {self.filter_counter}"
-
-        item = QtWidgets.QListWidgetItem(f"{filt.name}")
+            if self.ui.filters_list.currentRow() >= 0:
+                filt = copy.deepcopy(self.ui.filters_list.currentItem().data(QtCore.Qt.UserRole))
+                filt.name = f"Filter {self.filter_counter}"
+            else:
+                logger.info("Filter list empty")
+                filt = FirwinFilter(f"Filter {self.filter_counter}")
+        item = QtWidgets.QListWidgetItem(f"{str(filt)}")
         item.setData(QtCore.Qt.UserRole, filt)
         with block_signals(self.ui.filters_list):
             self.ui.filters_list.addItem(item)
             self.ui.filters_list.setCurrentItem(item)
+        # Add filter to plots
         plot = self.ui.plot0_widget.plot(antialias=True, name=filt.name)
         plot.setLogMode(False, False)
         color_ind = self.filter_counter % len(self.color_dict)
         color = list(self.color_dict.values())[color_ind]
         plot.setPen(pq.mkPen(color=color, width=2.0))
         self.amp_plot_list.append(plot)
+
+        plot = self.ui.plot2_widget.plot(antialias=True, name=filt.name)
+        plot.setLogMode(False, False)
+        color_ind = self.filter_counter % len(self.color_dict)
+        color = list(self.color_dict.values())[color_ind]
+        plot.setPen(pq.mkPen(color=color, width=2.0))
+        self.ph_plot_list.append(plot)
+
+        plot = self.ui.plot1_widget.plot(antialias=True, name=filt.name)
+        plot.setLogMode(False, False)
+        color_ind = self.filter_counter % len(self.color_dict)
+        color = list(self.color_dict.values())[color_ind]
+        plot.setPen(pq.mkPen(color=color, width=2.0))
+        self.dec_plot_list.append(plot)
         self.filter_counter += 1
         logger.info(f"Filter #{self.filter_counter} / {len(self.amp_plot_list)}")
         self.select_filter()
+
+    def remove_filter(self):
+        row = self.ui.filters_list.currentRow()
+        if row >= 0:
+            self.ui.filters_list.takeItem(row)
+            plt = self.amp_plot_list.pop(row)
+            self.ui.plot0_widget.removeItem(plt)
+            plt = self.dec_plot_list.pop(row)
+            self.ui.plot1_widget.removeItem(plt)
 
     def update_plot(self):
         item = self.ui.filters_list.currentItem()
@@ -359,11 +689,62 @@ class FIRDesign(QtWidgets.QWidget):
         f = w / np.pi
         logger.debug(f"Updating plot. Filter #{ind} / {len(self.amp_plot_list)}: {filt.name}")
         self.amp_plot_list[ind].setData(f, 20*np.log10(np.abs(h)))
+        self.ph_plot_list[ind].setData(f, (np.angle(h)) * 180 / np.pi)
+        self.update_dec_plot()
+
+    def update_dec_plot(self):
+        fs = self.ui.sampling_freq_spinbox.value() * 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex())
+        freq = fs * np.linspace(0, 1, self.ui.nfreq_spinbox.value()) / 2
+        fa = freq
+        h_tot = np.zeros_like(freq)
+        h_list = [h_tot]
+        for fi in range(self.ui.filters_list.count()):
+            k = np.round(freq / fs)
+            fa = np.abs(freq  - k * fs)
+            filt: FIRFilter = self.ui.filters_list.item(fi).data(QtCore.Qt.UserRole)
+            w, h = ss.freqz(filt.coe, worN=self.ui.nfreq_spinbox.value())
+            f = w / np.pi
+            h_amp = 20 * np.log10(np.abs(h))
+            filt_interp = interp1d(f, h_amp, bounds_error=False, fill_value="extrapolate")
+            h_int = filt_interp(2 * fa / fs)
+            h_tot += h_int
+            h_list.append(np.copy(h_tot))
+            self.dec_plot_list[fi].setData(freq, h_list[-1])
+            fs /= filt.decimation
+        self.update_freq_plot()
+        return fa
+
+    def update_freq_plot(self):
+        points = []
+        n_row = self.model.rowCount()
+        logger.info(f"Plotting {n_row} frequencies")
+        for row in range(n_row):
+            x = self.model.data(self.model.index(row, self.model.COL_FREQ), QtCore.Qt.UserRole)
+            y = self.model.data(self.model.index(row, self.model.COL_AMP), QtCore.Qt.UserRole)
+            d = {"pos": (x,y),
+                 "size": 10,
+                 "pen": pyqtgraph.mkPen(self.highlight_colors[row % len(self.highlight_colors)], width=2),
+                 "brush": None
+                 }
+            points.append(d)
+            x = self.model.data(self.model.index(row, self.model.COL_ALIAS), QtCore.Qt.UserRole)
+            y = self.model.data(self.model.index(row, self.model.COL_FILTERED), QtCore.Qt.UserRole)
+            d = {"pos": (x,y),
+                 "size": 10,
+                 "pen": None,
+                 "brush": pyqtgraph.mkBrush(self.highlight_colors[row % len(self.highlight_colors)])
+                 }
+            points.append(d)
+        self.freq_scatterplot.setData(points)
 
     def select_filter(self):
+        if self.ui.filters_list.currentRow() < 0:
+            logger.info("Filter list empty")
+            return
         item = self.ui.filters_list.currentItem()
+        row = self.ui.filters_list.currentRow()
         filt: FIRFilter = item.data(QtCore.Qt.UserRole)
-        logger.info(f"select_filter {item}: {filt}")
+        logger.info(f"select_filter {item}: {filt}, {row}, {self.ui.filters_list.item(row)}")
         slider_val = int(100 * (filt.n_taps - self.ui.ntaps_min_spinbox.value()) / (self.ui.ntaps_max_spinbox.value() - self.ui.ntaps_min_spinbox.value()))
         slider = self.ui.ntaps_slider
         slider.setEnabled(True)
@@ -375,6 +756,8 @@ class FIRDesign(QtWidgets.QWidget):
             self.ui.algo_combobox.setCurrentText(filt.algo)
         with block_signals(self.ui.filtertype_combobox):
             self.ui.filtertype_combobox.setCurrentText(filt.type.name)
+        with block_signals(self.ui.decimation_spinbox):
+            self.ui.decimation_spinbox.setValue(filt.decimation)
         p_keys = filt.parameters.keys()
         for ind, p in enumerate(p_keys):
             logger.info(f"Enabling {filt.parameters[p]}")
@@ -411,10 +794,66 @@ class FIRDesign(QtWidgets.QWidget):
 
         self.start_design()
 
+    def set_freq_suffix(self, value=None):
+        if not isinstance(value, float):
+            value = 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex())
+        logger.info(f"New suffix for {value}: {self.ui.sampling_freq_combobox.currentText()}")
+        self.model.update_suffix(value)
+
+    def set_sampling_freq(self, value=None):
+        if not isinstance(value, float):
+            value = self.ui.sampling_freq_spinbox.value()
+        logger.info(f"New sampling frequency: {value} {self.ui.sampling_freq_combobox.currentText()}")
+        self.model.update_alias_freq()
+        self.update_dec_plot()
+
+    def add_freq(self):
+        f_name = f"f{self.freq_counter}"
+        logger.info(f"Adding frequency {f_name}")
+        color = self.highlight_colors[self.freq_counter % len(self.highlight_colors)]
+        self.model.addRow(f_name, 100 * 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex()), 0, color)
+        self.freq_counter += 1
+        self.update_freq_plot()
+
+    def remove_freq(self):
+        ind = self.ui.freq_table.currentIndex()
+        if ind.isValid():
+            self.model.removeRow(ind.row())
+        self.update_freq_plot()
+
+    def calc_freq_response(self, freq, amp):
+        fs = self.ui.sampling_freq_spinbox.value() * 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex())
+        logger.debug(f"resp for {freq}")
+        h = 1
+        for fi in range(self.ui.filters_list.count()):
+            k = np.round(freq / fs)
+            freq = np.abs(freq  - k * fs)
+            w = freq * 2 * np.pi / (fs)
+            filt: FIRFilter = self.ui.filters_list.item(fi).data(QtCore.Qt.UserRole)
+            hf = np.sum(filt.coe * np.exp(-1j * w * np.arange(len(filt.coe))))
+            h *= hf
+            logger.debug(f"Filter {filt.name}: w {w:.2f} hf {20 * np.log10(np.abs(hf)):.2f} dB")
+            fs /= filt.decimation
+        return amp + 20 * np.log10(np.abs(h))
+
+    def calc_alias_freq(self, freq):
+        fs = self.ui.sampling_freq_spinbox.value() * 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex())
+        fa = freq
+        for fi in range(self.ui.filters_list.count()):
+            k = np.round(fa / fs)
+            fa = np.abs(fa  - k * fs)
+            filt: FIRFilter = self.ui.filters_list.item(fi).data(QtCore.Qt.UserRole)
+            fs /= filt.decimation
+        return fa
+
     def closeEvent(self, a0, QCloseEvent=None):
         logger.info(f"Saving settings.")
         self.settings.setValue("ntaps", self.ui.ntaps_spinbox.value())
         self.settings.setValue("nfreq", self.ui.nfreq_spinbox.value())
+        self.settings.setValue("sampling_freq", self.ui.sampling_freq_spinbox.value())
+        self.settings.setValue("sampling_freq_suffix", self.ui.sampling_freq_combobox.currentText())
+        self.settings.setValue("splitter", self.ui.splitter.saveState())
+        self.settings.setValue("splitter2", self.ui.splitter_2.saveState())
 
 
 def main():
