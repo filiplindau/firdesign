@@ -11,9 +11,9 @@ import threading
 import time
 import copy
 from contextlib import contextmanager
-from dataclasses import dataclass, field, astuple, fields
+from dataclasses import dataclass, field, astuple, fields, asdict
 from collections import OrderedDict
-from typing import Any
+from typing import Any, ClassVar, Dict, Type
 from enum import Enum, Flag
 
 import pyqtgraph
@@ -24,11 +24,13 @@ import pyqtgraph as pq
 import scipy.signal as ss
 from scipy.interpolate import interp1d
 from streamlit.runtime import get_instance
+from zope.interface import named
 
 from fir_design_gui import Ui_FIRDesign
 import multiprocessing as mp
 from typing import List
-from pathlib import Path
+import pathlib
+import yaml
 
 # Define a custom logging format
 # log_format = "%(asctime)s - %(levelname)s - %(funcName)s - %(message)s"
@@ -73,6 +75,14 @@ class FilterParameter:
     min: Any = None
     max: Any = None
 
+    def get_dict(self):
+        d = dict()
+        d["name"] = self.name
+        d["value"] = self.value
+        d["min"] = self.min
+        d["max"] = self.max
+        return d
+
 
 @dataclass
 class FIRFilter:
@@ -83,6 +93,18 @@ class FIRFilter:
     algo: str = ""
     decimation: int = 1
     parameters: OrderedDict[str, FilterParameter] = field(default_factory=OrderedDict)
+
+    # class-level registry mapping type name -> subclass
+    _registry: ClassVar[Dict[str, Type["FirFilter"]]] = {}
+
+    @classmethod
+    def register_subclass(cls, name: str):
+        """Decorator: register a subclass under 'name'."""
+        def decorator(subcls):
+            cls._registry[name] = subcls
+            subcls._type_name = name
+            return subcls
+        return decorator
 
     def __str__(self):
         return f"{self.name}: {self.n_taps} taps. {self.decimation}x decimation"
@@ -101,7 +123,50 @@ class FIRFilter:
         filter = FIRFilter(name)
         return filter
 
+    def to_yaml(self):
+        d = self.to_dict()
+        return yaml.safe_dump(d, sort_keys=False)
 
+    def to_dict(self):
+        d = dict()
+        d["name"] = self.name
+        d["type"] = self.type.name
+        d["algo"] = self.algo
+        d["n_taps"] = self.n_taps
+        d["decimation"] = self.decimation
+        params = [p.get_dict() for p in self.parameters.values()]
+        d["parameters"] = params
+        d["coe"] = ", ".join([f"{x:.6f}" for x in self.coe.tolist()])
+        return d
+
+    @classmethod
+    def from_yaml(cls, data):
+        # d = yaml.safe_load(data)
+        d = data
+        if "algo" not in d:
+            raise KeyError("Missing 'type' discriminator in serialized filter.")
+        t = d["algo"]
+        subcls: FIRFilter = cls._registry.get(t)
+        if subcls is None:
+            # as fallback, try by classname:
+            subcls = cls._registry.get(t) or next(
+                (c for n, c in cls._registry.items() if n == t), None
+            )
+        if subcls is None:
+            raise ValueError(f"Unknown filter type '{t}'. Registered: {list(cls._registry)}")
+        args = dict()
+        args["name"] = d["name"]
+        args["type"] = FilterType[d["type"]]
+        args["n_taps"] = d["n_taps"]
+        args["decimation"] = d["decimation"]
+        args["algo"] = d["algo"]
+        args["parameters"] = {fp["name"]: FilterParameter(**fp) for fp in d["parameters"]}
+        args["coe"] = np.array([float(x) for x in d["coe"].split(",")])
+        filter = subcls(**args)
+        return filter
+
+
+@FIRFilter.register_subclass("firwin")
 @dataclass
 class FirwinFilter(FIRFilter):
     @staticmethod
@@ -119,6 +184,7 @@ class FirwinFilter(FIRFilter):
                 f"width {self.parameters['width'].value:.3f}, {self.decimation}x decimation")
 
 
+@FIRFilter.register_subclass("kaiser")
 @dataclass
 class KaiserFilter(FIRFilter):
     @staticmethod
@@ -141,6 +207,7 @@ class KaiserFilter(FIRFilter):
                 f"stopband attenuation {self.parameters['stopband_att'].value:.2f} dB, {self.decimation}x decimation")
 
 
+@FIRFilter.register_subclass("remez")
 @dataclass
 class RemezFilter(FIRFilter):
     @staticmethod
@@ -420,6 +487,8 @@ class FIRDesign(QtWidgets.QWidget):
         self.ui = Ui_FIRDesign()
         self.ui.setupUi(self)
 
+        self.last_load_dir: pathlib.Path = None
+
         self.current_filter_ind = 0
         self.filter_counter = 0
         self.freq_counter = 0
@@ -512,6 +581,10 @@ class FIRDesign(QtWidgets.QWidget):
         if state is not None:
             self.ui.splitter_2.restoreState(state)
 
+        self.last_load_dir = self.settings.value("load_dir", pathlib.Path("."))
+        self.ui.save_filter_button.clicked.connect(self.save_filters)
+        self.ui.load_filter_button.clicked.connect(self.load_filters)
+
     def slider_update(self, value):
         """
         Slider was changed. Calculate value and update spinbox
@@ -542,12 +615,12 @@ class FIRDesign(QtWidgets.QWidget):
         self.spinbox_update()
 
     def slider_limit_update(self):
-        name = "_".join(self.sender().objectName().split("_")[:-1])
+        name = self.sender().objectName().split("_")[0]
         logger.info(f"update slider limits: {name}")
         max_val = getattr(self.ui, f"{name}_max_spinbox").value()
         min_val = getattr(self.ui, f"{name}_min_spinbox").value()
-        spinbox = getattr(self.ui, f"{name}_spinbox").value()
-        slider = getattr(self.ui, f"{name}_slider").value()
+        spinbox = getattr(self.ui, f"{name}_spinbox")
+        slider = getattr(self.ui, f"{name}_slider")
         cal_val = spinbox.value()
         slider_val = int(100 * (cal_val - min_val) / (max_val - min_val))
         with block_signals(slider):
@@ -602,12 +675,14 @@ class FIRDesign(QtWidgets.QWidget):
                 filter.parameters[p_keys[p_ind]].min = slider_min
                 filter.parameters[p_keys[p_ind]].max = slider_max
         filter.decimation = self.ui.decimation_spinbox.value()
-        item.setText(str(filter))
+        fs = self.ui.sampling_freq_spinbox.value() * 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex())
+        # item.setText(f"{str(filter)}, {filter.n_taps * fs * 1e-9:.2f} GMAC/s")
         item.setData(QtCore.Qt.UserRole, filter)
         if update_widgets:
             self.select_filter()
-            return
+
         self.start_design()
+        self.calc_compute()
 
 
     def start_design(self):
@@ -633,7 +708,20 @@ class FIRDesign(QtWidgets.QWidget):
         self.model.update_filtered_amplitudes()
         return
 
-    def add_filter(self, filt: FIRFilter = None):
+    def calc_compute(self):
+        fs = self.ui.sampling_freq_spinbox.value() * 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex())
+        comp_tot = 0
+        for fi in range(self.ui.filters_list.count()):
+            item: QtWidgets.QListWidgetItem = self.ui.filters_list.item(fi)
+            filt_: FIRFilter = item.data(QtCore.Qt.UserRole)
+            comp = filt_.n_taps * fs
+            comp_tot += comp
+            fs /= filt_.decimation
+            item.setText(f"{str(filt_)}, {comp * 1e-9:.2f} GMAC/s")
+        self.ui.total_compute_label.setText(f"{comp_tot * 1e-9:.2f} GMAC/s")
+
+
+    def add_filter(self, filt: FIRFilter=None):
         logger.info(f"Adding filter {self.filter_counter}")
         if not isinstance(filt, FIRFilter):
             if self.ui.filters_list.currentRow() >= 0:
@@ -671,6 +759,7 @@ class FIRDesign(QtWidgets.QWidget):
         self.filter_counter += 1
         logger.info(f"Filter #{self.filter_counter} / {len(self.amp_plot_list)}")
         self.select_filter()
+        self.update_parameters()
 
     def remove_filter(self):
         row = self.ui.filters_list.currentRow()
@@ -792,7 +881,9 @@ class FIRDesign(QtWidgets.QWidget):
             getattr(self.ui, f"p{p_ind}_spinbox").setEnabled(False)
             getattr(self.ui, f"p{p_ind}_slider").setEnabled(False)
 
-        self.start_design()
+        coe_str = ", ".join([f"{c:.3e}" for c in filt.coe])
+        self.ui.coe_label.setText(coe_str)
+        self.ui.coefficients_name_label.setText(f"{filt.name} coefficients:")
 
     def set_freq_suffix(self, value=None):
         if not isinstance(value, float):
@@ -846,6 +937,38 @@ class FIRDesign(QtWidgets.QWidget):
             fs /= filt.decimation
         return fa
 
+    def save_filters(self):
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(parent=self, caption="Save filter set as yaml",
+                                                            directory=str(self.last_load_dir),
+                                                            filter="yaml files (*.yml);;All files (*)")
+        filename = pathlib.Path(filename)
+        self.last_load_dir = filename.parent
+        logger.info(f"Saving filters to {filename}")
+        d = dict()
+        for fi in range(self.ui.filters_list.count()):
+            filt: FIRFilter = self.ui.filters_list.item(fi).data(QtCore.Qt.UserRole)
+            d[filt.name] = filt.to_dict()
+        s = yaml.safe_dump(d, sort_keys=False)
+        with open(filename, "w", encoding="utf-8") as fd:
+            fd.write(s)
+
+    def load_filters(self):
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(parent=self, caption="Save filter set as yaml",
+                                                            directory=str(self.last_load_dir),
+                                                            filter="yaml files (*.yml);;All files (*)")
+        filename = pathlib.Path(filename)
+        self.last_load_dir = filename.parent
+        logger.info(f"Loading filters from {filename}")
+        with open(filename, "r") as fd:
+            s = fd.read()
+        d = yaml.safe_load(s)
+        for fk in d.keys():
+            filt = FIRFilter.from_yaml(d[fk])
+            self.add_filter(filt)
+
+
+
+
     def closeEvent(self, a0, QCloseEvent=None):
         logger.info(f"Saving settings.")
         self.settings.setValue("ntaps", self.ui.ntaps_spinbox.value())
@@ -854,6 +977,7 @@ class FIRDesign(QtWidgets.QWidget):
         self.settings.setValue("sampling_freq_suffix", self.ui.sampling_freq_combobox.currentText())
         self.settings.setValue("splitter", self.ui.splitter.saveState())
         self.settings.setValue("splitter2", self.ui.splitter_2.saveState())
+        self.settings.setValue("load_dir", self.last_load_dir)
 
 
 def main():
