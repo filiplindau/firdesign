@@ -23,8 +23,8 @@ import argparse
 import pyqtgraph as pq
 import scipy.signal as ss
 from scipy.interpolate import interp1d
-from streamlit.runtime import get_instance
-from zope.interface import named
+#from streamlit.runtime import get_instance
+#from zope.interface import named
 
 from fir_design_gui import Ui_FIRDesign
 import multiprocessing as mp
@@ -584,6 +584,8 @@ class FIRDesign(QtWidgets.QWidget):
         self.last_load_dir = self.settings.value("load_dir", pathlib.Path("."))
         self.ui.save_filter_button.clicked.connect(self.save_filters)
         self.ui.load_filter_button.clicked.connect(self.load_filters)
+        self.ui.save_freq_button.clicked.connect(self.save_freqs)
+        self.ui.load_freq_button.clicked.connect(self.load_freqs)
 
     def slider_update(self, value):
         """
@@ -889,7 +891,9 @@ class FIRDesign(QtWidgets.QWidget):
         if not isinstance(value, float):
             value = 10 ** (3 * self.ui.sampling_freq_combobox.currentIndex())
         logger.info(f"New suffix for {value}: {self.ui.sampling_freq_combobox.currentText()}")
+        old_value = self.model.suffix_factor
         self.model.update_suffix(value)
+        self.ui.sampling_freq_spinbox.setValue(self.ui.sampling_freq_spinbox.value() / old_value / value)
 
     def set_sampling_freq(self, value=None):
         if not isinstance(value, float):
@@ -966,8 +970,45 @@ class FIRDesign(QtWidgets.QWidget):
             filt = FIRFilter.from_yaml(d[fk])
             self.add_filter(filt)
 
+    def save_freqs(self):
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(parent=self, caption="Save frequency set as yaml",
+                                                            directory=str(self.last_load_dir),
+                                                            filter="yaml files (*.yml);;All files (*)")
+        filename = pathlib.Path(filename)
+        self.last_load_dir = filename.parent
+        logger.info(f"Saving frequencies to {filename}")
+        d = dict()
+        for row in range(self.model.rowCount()):
+            name = self.model.data(self.model.index(row, self.model.COL_NAME), QtCore.Qt.UserRole)
+            freq = self.model.data(self.model.index(row, self.model.COL_FREQ), QtCore.Qt.UserRole)
+            amp = self.model.data(self.model.index(row, self.model.COL_AMP), QtCore.Qt.UserRole)
+            unit = self.ui.sampling_freq_combobox.currentText()
+            suffix_factor = self.model.suffix_factor
+            d[name] = {"freq": freq * suffix_factor, "amp": amp, "unit": unit}
+        s = yaml.safe_dump(d, sort_keys=False)
+        with open(filename, "w", encoding="utf-8") as fd:
+            fd.write(s)
 
-
+    def load_freqs(self):
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(parent=self, caption="Save frequency set as yaml",
+                                                            directory=str(self.last_load_dir),
+                                                            filter="yaml files (*.yml);;All files (*)")
+        filename = pathlib.Path(filename)
+        self.last_load_dir = filename.parent
+        logger.info(f"Loading frequencies from {filename}")
+        with open(filename, "r") as fd:
+            s = fd.read()
+        d = yaml.safe_load(s)
+        for name in d.keys():
+            f = d[name]["freq"]
+            a = d[name]["amp"]
+            u = d[name]["unit"]
+            ind = self.model.suffix_list.index(u)
+            suffix_factor = 10 ** (3 * ind)
+            color = self.highlight_colors[self.freq_counter % len(self.highlight_colors)]
+            self.model.addRow(name, f * suffix_factor, a, color)
+            self.freq_counter += 1
+        self.update_freq_plot()
 
     def closeEvent(self, a0, QCloseEvent=None):
         logger.info(f"Saving settings.")

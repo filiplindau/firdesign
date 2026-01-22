@@ -1,0 +1,16 @@
+f0:
+  freq: 144.0
+  amp: 0
+  unit: MHz
+fund:
+  freq: 77.0
+  amp: 0
+  unit: MHz
+local:
+  freq: 87.0
+  amp: 3.0
+  unit: MHz
+mix:
+  freq: 10.0
+  amp: 0
+  unit: MHz
