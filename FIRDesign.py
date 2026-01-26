@@ -123,6 +123,21 @@ class FIRFilter:
         filter = FIRFilter(name)
         return filter
 
+    def get_coe(self, regenerate=True, balance_phases=False, n_phases=1, quantization_bits=32):
+        if regenerate:
+            self.generate()
+        if balance_phases:
+            padding_size = (n_phases - (len(self.coe) % n_phases)) % n_phases
+            d = np.pad(self.coe, (0, padding_size), mode="constant").reshape(-1, n_phases)
+            d_int = (d * 2**quantization_bits).astype(np.int64)
+            d_sum = d_int.sum(0)
+            d_mean = d_sum.mean(0)
+            d_factor = d_mean / d_sum
+            coe = (d_int * d_factor).astype(np.int64).flatten() / 2**quantization_bits
+        else:
+            coe = self.coe
+        return coe
+
     def to_yaml(self):
         d = self.to_dict()
         return yaml.safe_dump(d, sort_keys=False)
@@ -180,7 +195,7 @@ class FirwinFilter(FIRFilter):
         return self.coe
 
     def __str__(self):
-        return (f"{self.name}: {self.type.name} of {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.3f}, "
+        return (f"{self.name}: {self.type.name} from {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.3f}, "
                 f"width {self.parameters['width'].value:.3f}, {self.decimation}x decimation")
 
 
@@ -202,7 +217,7 @@ class KaiserFilter(FIRFilter):
         return self.coe
 
     def __str__(self):
-        return (f"{self.name}: {self.type.name} of {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.2f}, "
+        return (f"{self.name}: {self.type.name} from {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.2f}, "
                 f"width {self.parameters['width'].value:.2f}, "
                 f"stopband attenuation {self.parameters['stopband_att'].value:.2f} dB, {self.decimation}x decimation")
 
@@ -224,7 +239,7 @@ class RemezFilter(FIRFilter):
         return self.coe
 
     def __str__(self):
-        return (f"{self.name}: {self.type.name} of {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.3f}, "
+        return (f"{self.name}: {self.type.name} from {self.algo}, {self.n_taps} taps, fc {self.parameters['fc'].value:.3f}, "
                 f"width {self.parameters['width'].value:.3f}, {self.decimation}x decimation")
 
 NYQUIST = 48000
@@ -497,6 +512,7 @@ class FIRDesign(QtWidgets.QWidget):
         self.amp_plot_list = list()
         self.ph_plot_list = list()
         self.dec_plot_list = list()
+        self.zoom_plot_list = list()
         self.freq_scatterplot = None
 
         self.model = FrequencyModel(filter_calc_cb=self.calc_freq_response, alias_calc_cb=self.calc_alias_freq)
@@ -522,6 +538,7 @@ class FIRDesign(QtWidgets.QWidget):
         self.ui.algo_combobox.currentIndexChanged.connect(self.update_parameters)
         self.ui.coe_label.setWordWrap(True)
         self.ui.coe_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard)
+        self.ui.export_coe_button.clicked.connect(self.export_coe)
 
         self.ui.plot0_widget.getPlotItem().showGrid(True, True)
         self.ui.plot0_widget.getPlotItem().addLegend()
@@ -534,6 +551,11 @@ class FIRDesign(QtWidgets.QWidget):
         ax.setLabel("Freq", units="Hz")
         self.freq_scatterplot = pyqtgraph.ScatterPlotItem()
         self.ui.plot1_widget.addItem(self.freq_scatterplot)
+        self.ui.plot_zoom_widget.getPlotItem().showGrid(True, True)
+        self.ui.plot_zoom_widget.setYRange(0.5, -0.5)
+        ax = self.ui.plot_zoom_widget.getPlotItem().getAxis("bottom")
+        ax.enableAutoSIPrefix(True)
+        ax.setLabel("Freq", units="Hz")
         self.ui.nfreq_spinbox.setValue(self.settings.value("nfreq", 2048, type=int))
         self.ui.nfreq_spinbox.editingFinished.connect(self.update_plot)
 
@@ -696,7 +718,7 @@ class FIRDesign(QtWidgets.QWidget):
         coe_str = ", ".join([f"{c:.3e}" for c in coe])
         logger.info(f"Generating {filt.name} filter: {filt.n_taps} taps using {filt.algo}.")
         self.ui.coe_label.setText(coe_str)
-        self.ui.coefficients_name_label.setText(f"{filt.name} coefficients:")
+        self.ui.coefficients_name_label.setText(f"{filt.name.upper()} coefficients:")
         with block_signals(self.ui.ntaps_spinbox):
             self.ui.ntaps_spinbox.setValue(filt.n_taps)
         max_val = self.ui.ntaps_max_spinbox.value()
@@ -758,6 +780,14 @@ class FIRDesign(QtWidgets.QWidget):
         color = list(self.color_dict.values())[color_ind]
         plot.setPen(pq.mkPen(color=color, width=2.0))
         self.dec_plot_list.append(plot)
+
+        plot = self.ui.plot_zoom_widget.plot(antialias=True, name=filt.name)
+        plot.setLogMode(False, False)
+        color_ind = self.filter_counter % len(self.color_dict)
+        color = list(self.color_dict.values())[color_ind]
+        plot.setPen(pq.mkPen(color=color, width=2.0))
+        self.zoom_plot_list.append(plot)
+
         self.filter_counter += 1
         logger.info(f"Filter #{self.filter_counter} / {len(self.amp_plot_list)}")
         self.select_filter()
@@ -771,6 +801,8 @@ class FIRDesign(QtWidgets.QWidget):
             self.ui.plot0_widget.removeItem(plt)
             plt = self.dec_plot_list.pop(row)
             self.ui.plot1_widget.removeItem(plt)
+            plt = self.zoom_plot_list.pop(row)
+            self.ui.plot_zoom_widget.removeItem(plt)
 
     def update_plot(self):
         item = self.ui.filters_list.currentItem()
@@ -801,6 +833,7 @@ class FIRDesign(QtWidgets.QWidget):
             h_tot += h_int
             h_list.append(np.copy(h_tot))
             self.dec_plot_list[fi].setData(freq, h_list[-1])
+            self.zoom_plot_list[fi].setData(freq, h_list[-1])
             fs /= filt.decimation
         self.update_freq_plot()
         return fa
@@ -1009,6 +1042,24 @@ class FIRDesign(QtWidgets.QWidget):
             self.model.addRow(name, f * suffix_factor, a, color)
             self.freq_counter += 1
         self.update_freq_plot()
+
+    def export_coe(self):
+        if self.ui.filters_list.currentRow() < 0:
+            logger.info("Filter list empty")
+            return
+        filt = self.ui.filters_list.currentItem().data(QtCore.Qt.UserRole)
+        coe = filt.get_coe(regenerate=True, balance_phases=self.ui.balance_coe_radiobutton.isChecked(),
+                           n_phases=self.ui.decimation_spinbox.value(), quantization_bits=32)
+        coe_str = ",\n".join([f"{c}" for c in coe])
+        s = (f"; {filt.type.name} filter generated with {filt.algo} method\n"
+             f"; {filt.n_taps} taps, {', '.join([f'{v.name}={v.value:.3f}' for v in filt.parameters.values()])}\n"
+             f";\n"
+             f"Radix = 10;\n"
+             f"CoefData = \n{coe_str};")
+        filename = f"{filt.name}.coe"
+        with open(filename, "w") as f:
+            f.write(s)
+        logger.info(f"Wrote coe file {filename}:\n\n{s}")
 
     def closeEvent(self, a0, QCloseEvent=None):
         logger.info(f"Saving settings.")
