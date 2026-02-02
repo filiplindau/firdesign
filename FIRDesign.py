@@ -631,12 +631,13 @@ class FIRDesign(QtWidgets.QWidget):
             # min_val = param.min
         cal_val = min_val + (max_val - min_val) * slider.value() / 100.0
         logger.debug(f"Slider {name} rel value: {value}, actual: {cal_val}")
-        spinbox = self.ui.__dict__[f"{name}_spinbox"]
-        if isinstance(spinbox, QtWidgets.QSpinBox):
-            spinbox.setValue(int(cal_val))
-        else:
-            spinbox.setValue(cal_val)
-        self.spinbox_update()
+        spinbox = getattr(self.ui, f"{name}_spinbox")
+        with block_signals(spinbox):
+            if isinstance(spinbox, QtWidgets.QSpinBox):
+                spinbox.setValue(int(cal_val))
+            else:
+                spinbox.setValue(cal_val)
+        self.update_parameters()
 
     def slider_limit_update(self):
         name = self.sender().objectName().split("_")[0]
@@ -652,15 +653,22 @@ class FIRDesign(QtWidgets.QWidget):
         self.update_parameters()
 
     def spinbox_update(self):
-        name = "_".join(self.sender().objectName().split("_")[:-1])
+        spinbox = self.sender()
+        if not spinbox: return
+
+        name = "_".join(spinbox.objectName().split("_")[:-1])
         logger.debug(f"spinbox_update {name}")
         # Update slider
         max_val = getattr(self.ui, f"{name}_max_spinbox").value()
         min_val = getattr(self.ui, f"{name}_min_spinbox").value()
-        spinbox = getattr(self.ui, f"{name}_spinbox")
         slider = getattr(self.ui, f"{name}_slider")
         cal_val = spinbox.value()
-        slider_val = int(100 * (cal_val - min_val) / (max_val - min_val))
+        denom = max_val - min_val
+        if denom == 0:
+            slider_val = 0
+        else:
+            slider_val = int(100 * (cal_val - min_val) / denom)
+
         logger.debug(f"Updating slider {name} to {cal_val}")
         with block_signals(slider):
             slider.setValue(slider_val)
